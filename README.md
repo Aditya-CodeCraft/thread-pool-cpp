@@ -20,9 +20,10 @@ std::cout << sum.get();  // 5
 - Fixed-size pool (`tp::ThreadPool`) with a configurable number of workers (default: `hardware_concurrency()`, at least 1).
 - Variadic `submit(f, args...)` that perfect-forwards into the task and returns `std::future<R>`, for any `R` including `void` and move-only types.
 - Exceptions thrown by tasks travel to `future::get()`; worker threads never die from a task's exception.
+- Work-helping `wait(future)`: a task waiting on its subtasks runs queued work instead of blocking, so nested parallelism can't starve the pool.
 - Safe shutdown: idempotent, callable from several threads at once, drains the queue, joins all workers, and detects self-shutdown from a worker (throws instead of deadlocking).
 - No busy waiting: idle workers sleep on a condition variable.
-- 34 GoogleTest tests, including multi-producer stress and destruction under load.
+- 40 GoogleTest tests, including multi-producer stress and destruction under load.
 - ASan+UBSan and TSan build configurations, and a GitHub Actions matrix (GCC and Clang × debug/release/asan-ubsan/tsan).
 
 ## Project layout
@@ -77,6 +78,23 @@ auto submit(F&& f, Args&&... args)
    - Like `std::async`, arguments are stored by value. To share an object, pass `std::ref(obj)`. A callable that takes `T&` won't compile with a plain lvalue, which catches accidental dangling references at compile time.
 3. **Packaging.** The bound lambda goes into a `std::packaged_task<R()>` held by a `shared_ptr`, and its `get_future()` is taken.
 4. **Enqueue.** A `[task]{ (*task)(); }` wrapper is pushed into the queue. If the queue is closed, `submit` throws `PoolStoppedError`.
+
+## Nested tasks and `wait()`
+
+A fixed-size pool has a classic deadlock: if every worker runs a task that calls `future.get()` on a subtask that is still queued, no worker is left to run the subtasks. `ThreadPool::wait(future)` avoids this:
+
+```cpp
+auto parent = pool.submit([&pool] {
+    auto child = pool.submit([] { return 20; });
+    return pool.wait(child) + 1;   // child.get() here could deadlock
+});
+```
+
+- **Off the pool's threads,** `wait(f)` is just `f.get()`.
+- **On a worker,** while the result isn't ready it pops and runs other queued tasks (`try_pop`, never spinning). When the queue is empty, the awaited task has already been taken by some worker, which is either running it or helping the same way. In that case it is safe to block in `future.wait()`.
+- Exceptions are rethrown exactly like `get()`.
+
+The guarantee covers acyclic dependencies between tasks of the same pool. It can't help with futures from outside the pool, cyclic dependencies, or tasks that never return.
 
 ## Futures and packaged tasks
 
@@ -140,6 +158,7 @@ What's covered:
 | Exceptions | `ExceptionsPropagateThroughFuture`, `VoidTaskExceptionPropagates`, `NonStdExceptionPropagates`, `WorkersSurviveThrowingTasks` |
 | Shutdown | `SubmitAfterShutdownThrows`, `ShutdownIsIdempotent`, `ShutdownDrainsPendingTasks`, `ConcurrentShutdownCallsAllWaitForTheJoin`, `ShutdownFromWorkerThrowsInsteadOfDeadlocking` |
 | Destruction under load | `DestructorUnderLoadRunsEveryAcceptedTask`, `DestructorWhileProducersAreSubmitting` |
+| Nested tasks (`wait`) | `OffPoolThreadBehavesLikeGet`, `NestedWaitOnSingleWorkerDoesNotDeadlock`, `AllWorkersWaitingOnSubtasksDoNotStarve`, `RecursiveDivideAndConquer`, `NestedExceptionPropagatesThroughWait`, `ShutdownWhileTasksAreHelping` |
 | Stress / races | `MultipleProducersThousandsOfTasks` (20,000 tasks from 8 producers), `SharedCounterWithMutexHasNoLostUpdates`, `RepeatedCreateAndDestroy`, `TasksRunOnWorkerThreadsConcurrently` |
 | Queue | FIFO, `try_pop`, move-only types, close/drain, `PopBlocksUntilPush`, `CloseWakesAllBlockedConsumers`, MPMC no-loss, per-producer order |
 
@@ -215,7 +234,7 @@ target_link_libraries(my_app PRIVATE thread_pool::thread_pool)
 - **Unbounded queue, no back-pressure.** A producer can enqueue faster than workers drain and grow memory without limit. A bounded queue with a blocking or failing `push` would fix that.
 - **No cancellation or priorities.** Once submitted, a task will run. FIFO order only.
 - **Shutdown waits for every task.** A task that never returns makes `shutdown()` (and the destructor) block forever. There's no timeout or "discard pending" mode.
-- **Nested waiting can deadlock.** If every worker blocks on `future::get()` for a task that's still queued behind them, nothing can make progress. That's inherent to fixed-size pools, so don't block on the same pool's futures from inside its tasks.
+- **Use `pool.wait(f)`, not `f.get()`, inside tasks.** Plain `get()` on a same-pool future from a worker can still starve the pool. `wait()` prevents that for acyclic task dependencies. A helping worker may run an unrelated long task before noticing its own result is ready, which adds latency.
 - **Destroying the pool from one of its own tasks** calls `std::terminate`, because the destructor can't throw. `shutdown()` from a task throws `std::logic_error`.
 - **Fixed size.** The thread count can't change after construction.
 - Benchmarks aren't included, so no performance claims are made.
