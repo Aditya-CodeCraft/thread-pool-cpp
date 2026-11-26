@@ -275,6 +275,109 @@ TEST(ThreadPool, DestructorWhileProducersAreSubmitting) {
     EXPECT_EQ(executed.load(), accepted.load());
 }
 
+// ---- nested tasks: wait() ------------------------------------------------
+
+TEST(ThreadPoolWait, OffPoolThreadBehavesLikeGet) {
+    ThreadPool pool(2);
+    auto f = pool.submit([] { return 7; });
+    EXPECT_EQ(pool.wait(f), 7);
+    auto v = pool.submit([] {});
+    pool.wait(v);
+    auto bad = pool.submit([]() -> int { throw std::runtime_error("x"); });
+    EXPECT_THROW(pool.wait(bad), std::runtime_error);
+}
+
+TEST(ThreadPoolWait, NestedWaitOnSingleWorkerDoesNotDeadlock) {
+    // With one worker, `inner.get()` here would deadlock: the only worker is
+    // busy running `outer`, so `inner` would never be dequeued.
+    ThreadPool pool(1);
+    auto outer = pool.submit([&pool] {
+        auto inner = pool.submit([] { return 20; });
+        return pool.wait(inner) + 1;
+    });
+    ASSERT_EQ(outer.wait_for(10s), std::future_status::ready) << "nested wait deadlocked";
+    EXPECT_EQ(outer.get(), 21);
+}
+
+TEST(ThreadPoolWait, AllWorkersWaitingOnSubtasksDoNotStarve) {
+    // Every worker runs a parent that waits on children queued behind the other
+    // parents: the classic fixed-pool starvation deadlock with plain get().
+    constexpr int kParents = 16;
+    constexpr int kChildren = 8;
+    ThreadPool pool(2);
+    std::vector<std::future<int>> parents;
+    for (int p = 0; p < kParents; ++p) {
+        parents.push_back(pool.submit([&pool] {
+            std::vector<std::future<int>> children;
+            for (int c = 0; c < kChildren; ++c) {
+                children.push_back(pool.submit([c] { return c; }));
+            }
+            int sum = 0;
+            for (auto& child : children) sum += pool.wait(child);
+            return sum;
+        }));
+    }
+    for (auto& f : parents) {
+        ASSERT_EQ(f.wait_for(30s), std::future_status::ready) << "worker starvation deadlock";
+        EXPECT_EQ(f.get(), kChildren * (kChildren - 1) / 2);
+    }
+}
+
+namespace {
+long long fib(ThreadPool& pool, int n) {
+    if (n < 2) return n;
+    auto left = pool.submit(fib, std::ref(pool), n - 1);
+    long long right = fib(pool, n - 2);
+    return pool.wait(left) + right;
+}
+}  // namespace
+
+TEST(ThreadPoolWait, RecursiveDivideAndConquer) {
+    ThreadPool pool(4);
+    auto f = pool.submit(fib, std::ref(pool), 18);
+    ASSERT_EQ(f.wait_for(60s), std::future_status::ready) << "recursive wait deadlocked";
+    EXPECT_EQ(f.get(), 2584);
+}
+
+TEST(ThreadPoolWait, NestedExceptionPropagatesThroughWait) {
+    ThreadPool pool(1);
+    auto outer = pool.submit([&pool] {
+        auto inner = pool.submit([]() -> int { throw std::runtime_error("inner"); });
+        return pool.wait(inner);
+    });
+    ASSERT_EQ(outer.wait_for(10s), std::future_status::ready);
+    EXPECT_THROW(outer.get(), std::runtime_error);
+}
+
+TEST(ThreadPoolWait, ShutdownWhileTasksAreHelping) {
+    // The destructor closes the queue while parents are spawning children and
+    // helping. Children are either accepted (and then run) or rejected; every
+    // parent must still finish, and the destructor must not hang.
+    std::atomic<int> parents_done{0};
+    std::atomic<int> accepted{0};
+    std::atomic<int> executed{0};
+    {
+        ThreadPool pool(3);
+        for (int p = 0; p < 20; ++p) {
+            pool.submit([&] {
+                std::vector<std::future<void>> kids;
+                for (int c = 0; c < 10; ++c) {
+                    try {
+                        kids.push_back(pool.submit([&executed] { executed.fetch_add(1); }));
+                        accepted.fetch_add(1);
+                    } catch (const tp::PoolStoppedError&) {
+                        break;  // shutdown began: stop spawning, finish what we have
+                    }
+                }
+                for (auto& k : kids) pool.wait(k);
+                parents_done.fetch_add(1);
+            });
+        }
+    }
+    EXPECT_EQ(parents_done.load(), 20);
+    EXPECT_EQ(executed.load(), accepted.load());
+}
+
 // ---- stress -------------------------------------------------------------
 
 TEST(ThreadPoolStress, MultipleProducersThousandsOfTasks) {
