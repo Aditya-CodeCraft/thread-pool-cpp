@@ -176,6 +176,8 @@ cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan
 
 The test presets set `halt_on_error`, so any sanitizer report fails the test.
 
+`tests/tsan.supp` suppresses one known TSan **false positive**. libstdc++ is not TSan-instrumented, so TSan can't see the atomic reference count of an exception that is passed through a future. It then sometimes reports the exception's destructor (on a worker) as racing with `e.what()` (on the caller). Only the destructors of `std::runtime_error` and `std::logic_error` are suppressed. This was observed once in CI with GCC 13 and couldn't be reproduced locally in 300 runs.
+
 **TSan on recent Linux kernels:** if TSan aborts with `FATAL: ThreadSanitizer: unexpected memory mapping`, the kernel's ASLR entropy is too high for the TSan runtime. Use either of these fixes:
 
 ```sh

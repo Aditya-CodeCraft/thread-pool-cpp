@@ -1,0 +1,11 @@
+# ThreadSanitizer suppressions.
+#
+# A std::exception_ptr stored in a future is reference-counted with atomics
+# inside libstdc++/libsupc++, which distributions ship *without* TSan
+# instrumentation. When the caller's thread reads e.what() and a worker later
+# drops the last reference and frees the exception, TSan cannot see the atomic
+# refcount that orders the two and reports a false data race inside the
+# exception's destructor. Only the destruction of standard exception objects is
+# suppressed; races in the pool or the tests themselves are still reported.
+race:std::runtime_error::~runtime_error
+race:std::logic_error::~logic_error
