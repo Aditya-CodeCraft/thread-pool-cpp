@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.compiler.name }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { name: gcc, cxx: g++ }
+          - { name: clang, cxx: clang++ }
+        preset: [debug, release, asan-ubsan, tsan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++ clang libclang-rt-18-dev
+
+      # TSan in GCC 13 / Clang 18 cannot handle the high mmap ASLR entropy of
+      # recent kernels ("FATAL: ThreadSanitizer: unexpected memory mapping").
+      - name: Lower ASLR entropy for ThreadSanitizer
+        if: matrix.preset == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler.cxx }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        # Run the suite three times: concurrency bugs are often intermittent.
+        run: >
+          ctest --preset ${{ matrix.preset }} --repeat until-fail:3
+          --output-junit ${{ github.workspace }}/junit-${{ matrix.compiler.name }}-${{ matrix.preset }}.xml
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.compiler.name }}-${{ matrix.preset }}
+          path: junit-*.xml
