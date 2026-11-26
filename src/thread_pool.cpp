@@ -62,6 +62,15 @@ void ThreadPool::worker_loop() {
     }
 }
 
+bool ThreadPool::run_pending_task() {
+    std::optional<Task> task = tasks_.try_pop();
+    if (!task) {
+        return false;
+    }
+    (*task)();
+    return true;
+}
+
 bool ThreadPool::is_worker_thread() const {
     const auto self = std::this_thread::get_id();
     return std::find(worker_ids_.begin(), worker_ids_.end(), self) != worker_ids_.end();

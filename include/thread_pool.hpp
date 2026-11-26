@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <future>
@@ -54,6 +55,16 @@ public:
     auto submit(F&& f, Args&&... args)
         -> std::future<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>;
 
+    // Waits for `future` and returns its result (rethrowing its exception),
+    // like future.get(). Use this instead of get() when waiting *inside* a
+    // task on another task of the same pool: on a worker thread it keeps
+    // running queued tasks while the result is not ready, so a task waiting
+    // on its subtasks cannot starve the pool (with plain get(), N tasks
+    // waiting on queued subtasks would block all N workers forever).
+    // Off the pool's threads it is exactly future.get().
+    template <typename R>
+    R wait(std::future<R>& future);
+
     // Stops accepting tasks, drains the queue and joins all workers.
     // Idempotent and safe to call from several threads at once.
     // Must not be called from inside a task (it would wait for itself);
@@ -70,6 +81,8 @@ private:
     using Task = std::function<void()>;
 
     void worker_loop();
+    // Runs one queued task on the calling thread. Returns false if none is queued.
+    bool run_pending_task();
     bool is_worker_thread() const;
 
     const std::size_t thread_count_;
@@ -110,6 +123,22 @@ auto ThreadPool::submit(F&& f, Args&&... args)
         throw PoolStoppedError();
     }
     return result;
+}
+
+template <typename R>
+R ThreadPool::wait(std::future<R>& future) {
+    if (is_worker_thread()) {
+        // Help until the result is ready. When the queue is empty, the task we
+        // depend on has already been taken by some worker, which is itself
+        // either running it or helping in the same way, so blocking is safe.
+        while (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            if (!run_pending_task()) {
+                future.wait();
+                break;
+            }
+        }
+    }
+    return future.get();
 }
 
 }  // namespace tp
