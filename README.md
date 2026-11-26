@@ -222,4 +222,4 @@ target_link_libraries(my_app PRIVATE thread_pool::thread_pool)
 
 ## License
 
-No license file has been chosen yet. Add one (for example MIT) before publishing.
+MIT. See [LICENSE](LICENSE).
