@@ -14,9 +14,11 @@ ThreadPool::ThreadPool(std::size_t thread_count) : thread_count_(thread_count) {
         throw std::invalid_argument("ThreadPool needs at least one worker thread");
     }
     workers_.reserve(thread_count);
+    worker_ids_.reserve(thread_count);
     try {
         for (std::size_t i = 0; i < thread_count; ++i) {
             workers_.emplace_back(&ThreadPool::worker_loop, this);
+            worker_ids_.push_back(workers_.back().get_id());
         }
     } catch (...) {
         // Thread creation failed part-way: the destructor will not run for a
@@ -61,10 +63,8 @@ void ThreadPool::worker_loop() {
 }
 
 bool ThreadPool::is_worker_thread() const {
-    // workers_ is only modified in the constructor, so reading it here is safe.
     const auto self = std::this_thread::get_id();
-    return std::any_of(workers_.begin(), workers_.end(),
-                       [self](const std::thread& t) { return t.get_id() == self; });
+    return std::find(worker_ids_.begin(), worker_ids_.end(), self) != worker_ids_.end();
 }
 
 }  // namespace tp

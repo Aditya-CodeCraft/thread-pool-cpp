@@ -75,6 +75,10 @@ private:
     const std::size_t thread_count_;
     ThreadSafeQueue<Task> tasks_;
     std::vector<std::thread> workers_;
+    // Copy of the workers' ids, written only in the constructor. shutdown()
+    // reads it instead of workers_ because join() mutates the std::thread
+    // objects, which would race with a concurrent shutdown() call.
+    std::vector<std::thread::id> worker_ids_;
 
     // Set once shutdown() begins; read lock-free by is_running().
     std::atomic<bool> stopping_{false};
